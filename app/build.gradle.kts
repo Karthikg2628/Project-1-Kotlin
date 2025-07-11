@@ -76,6 +76,10 @@ dependencies {
             implementation ("androidx.media3:media3-exoplayer:1.1.1")
             implementation ("androidx.media3:media3-ui:1.1.1")
             implementation ("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4")
+        implementation("org.java-websocket:Java-WebSocket:1.5.2")
+        implementation("com.squareup.okhttp3:okhttp:4.9.3")
+        implementation("org.slf4j:slf4j-android:1.7.36")
+
 
         }
 
@@ -89,7 +93,7 @@ dependencies {
         // Your existing dependencies ...
 
             implementation ("org.slf4j:slf4j-api:1.7.36") // or your SLF4J version
-            implementation ("org.slf4j:slf4j-simple:1.7.36")  // Simple logger implementation
+              // Simple logger implementation
 
 
     }
