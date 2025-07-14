@@ -1,3 +1,5 @@
+// app/src/main/java/com/example/origin/WebSocketServer.kt
+
 import org.java_websocket.server.WebSocketServer
 import org.java_websocket.WebSocket
 import org.java_websocket.handshake.ClientHandshake
@@ -7,8 +9,9 @@ import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicInteger
 import java.io.ByteArrayOutputStream
 import android.graphics.*
-import android.os.Parcel
-import java.util.Collections
+import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.zip.Deflater
 import kotlin.math.max
 import kotlin.math.min
@@ -23,18 +26,22 @@ class VideoWebSocketServer(
 ) : WebSocketServer(InetSocketAddress(port)) {
 
     // Thread-safe collections
-    private val clients = Collections.synchronizedSet(mutableSetOf<WebSocket>())
+    private val clients = CopyOnWriteArraySet<WebSocket>()
     private val pausedClients = CopyOnWriteArraySet<WebSocket>()
     private val clientStats = ConcurrentHashMap<WebSocket, ClientStats>()
 
     // Frame control
+    @Volatile
     private var frameIntervalMs = 1000 / maxFps
     private val lagCount = AtomicInteger(0)
+    @Volatile
     private var currentMaxBandwidth = maxBandwidthKbps * 1024
+    @Volatile
     private var currentQuality = 80
     private var frameCounter = AtomicInteger(0)
 
     // Reusable objects
+    @Volatile
     private var reusableBitmap: Bitmap = Bitmap.createBitmap(defaultWidth, defaultHeight, Bitmap.Config.RGB_565)
     private val reusableCanvas = Canvas(reusableBitmap)
     private val paint = Paint().apply {
@@ -51,13 +58,13 @@ class VideoWebSocketServer(
     // Statistics
     private var totalFramesSent = 0L
     private var totalBytesSent = 0L
-    private val bandwidthWindow = ArrayDeque<Long>(10)
+    private val bandwidthWindow = ConcurrentLinkedDeque<Long>()
 
     data class ClientStats(
-        var lastAckTime: Long = System.currentTimeMillis(),
-        var framesReceived: Int = 0,
-        var lagReports: Int = 0,
-        var bandwidthUsage: Long = 0
+        @Volatile var lastAckTime: Long = System.currentTimeMillis(),
+        @Volatile var framesReceived: Int = 0,
+        @Volatile var lagReports: Int = 0,
+        @Volatile var bandwidthUsage: Long = 0
     )
 
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
@@ -105,7 +112,9 @@ class VideoWebSocketServer(
             clients.forEach { it.close(1000, "Server shutdown") }
             stop(1000)
 
-            reusableBitmap.recycle()
+            if (!reusableBitmap.isRecycled) {
+                reusableBitmap.recycle()
+            }
             Log.i("WS", "Server stopped. Sent $totalFramesSent frames (${totalBytesSent/1024}KB)")
         } catch (e: Exception) {
             Log.e("WS", "Shutdown error", e)
@@ -132,7 +141,7 @@ class VideoWebSocketServer(
     private fun generateFrame(): ByteArray {
         val frameNum = frameCounter.incrementAndGet()
 
-        // Draw test pattern
+        // Draw test pattern (replace with real frame data for production)
         reusableCanvas.drawColor(Color.BLACK)
         val x = (System.currentTimeMillis() % defaultWidth).toFloat()
         val y = (System.currentTimeMillis() % defaultHeight).toFloat()
@@ -148,7 +157,9 @@ class VideoWebSocketServer(
 
     private fun compressFrameToJpeg(quality: Int): ByteArray {
         return ByteArrayOutputStream().use { baos ->
-            reusableBitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+            if (!reusableBitmap.isRecycled) {
+                reusableBitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+            }
             val compressed = baos.toByteArray()
 
             // Further compress if needed
@@ -180,7 +191,6 @@ class VideoWebSocketServer(
     private fun sendToAllClients(frame: ByteArray) {
         if (frame.isEmpty()) return
 
-        val sendingTime = System.currentTimeMillis()
         clients.forEach { client ->
             if (client.isOpen && !pausedClients.contains(client)) {
                 try {
@@ -191,6 +201,9 @@ class VideoWebSocketServer(
                 } catch (e: Exception) {
                     Log.e("WS", "Send failed to ${client.remoteSocketAddress}", e)
                     clients.remove(client)
+                    pausedClients.remove(client)
+                    clientStats.remove(client)
+                    client.close()
                 }
             }
         }
@@ -230,15 +243,16 @@ class VideoWebSocketServer(
     }
 
     private fun shouldThrottle(): Boolean {
-        // Calculate current bandwidth usage (bytes per second)
-        val currentUsage = bandwidthWindow.sum()
+        val currentUsage = synchronized(bandwidthWindow) { bandwidthWindow.sum() }
         return currentUsage > currentMaxBandwidth
     }
 
     private fun updateBandwidthStats(frameSize: Int) {
-        bandwidthWindow.addLast(frameSize.toLong() * clients.size)
-        if (bandwidthWindow.size > 10) {
-            bandwidthWindow.removeFirst()
+        synchronized(bandwidthWindow) {
+            bandwidthWindow.addLast(frameSize.toLong() * clients.size)
+            if (bandwidthWindow.size > 10) {
+                bandwidthWindow.removeFirst()
+            }
         }
     }
 
@@ -258,7 +272,6 @@ class VideoWebSocketServer(
         stats.lastAckTime = System.currentTimeMillis()
         stats.framesReceived++
 
-        // Gradually improve quality if no lag reports
         if (stats.lagReports == 0 && currentQuality < 80) {
             currentQuality = min(80, currentQuality + 5)
         }
@@ -275,8 +288,8 @@ class VideoWebSocketServer(
         try {
             val requested = message.substringAfter("BANDWIDTH").trim().toInt()
             currentMaxBandwidth = when {
-                requested <= 0 -> 256 * 1024  // 256KB/s minimum
-                requested > 8192 -> 8192 * 1024 // 8MB/s maximum
+                requested <= 0 -> 256 * 1024
+                requested > 8192 -> 8192 * 1024
                 else -> requested * 1024
             }
             Log.i("QOS", "Adjusted bandwidth to ${currentMaxBandwidth/1024}KB/s")
@@ -296,7 +309,7 @@ class VideoWebSocketServer(
     }
 
     private fun recreateBitmapIfNeeded(width: Int, height: Int) {
-        if (reusableBitmap.width != width || reusableBitmap.height != height) {
+        if ((reusableBitmap.width != width || reusableBitmap.height != height) && !reusableBitmap.isRecycled) {
             reusableBitmap.recycle()
             reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
             reusableCanvas.setBitmap(reusableBitmap)
