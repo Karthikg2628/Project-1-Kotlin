@@ -1,16 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="com.example.origin">
+    package="com.example.origin"> <!-- CONFIRM THIS PACKAGE MATCHES ALL YOUR .KT FILES -->
 
-    <!-- Existing permissions -->
+    <!-- Required Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- Removed duplicate INTERNET permission -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Specific foreground service type permission for Android 14+ -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-
-    <!-- NEW PERMISSION: Required for posting notifications on Android 13 (API 33) and higher -->
+    <!-- Required for posting notifications on Android 13 (API 33) and higher -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -34,6 +38,7 @@
             </intent-filter>
         </activity>
 
+        <!-- Service declaration: THIS IS THE CRITICAL CHANGE -->
         <service
             android:name=".StreamingForegroundService"
             android:enabled="true"

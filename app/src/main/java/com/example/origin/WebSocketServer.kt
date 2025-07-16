@@ -1,130 +1,111 @@
-package com.example.origin
+// WebSocketClientManager.kt (Origin App)
+package com.example.origin // Ensure this matches your manifest package
 
-import android.content.Context
 import android.util.Log
-import org.java_websocket.WebSocket
-import org.java_websocket.handshake.ClientHandshake
-import org.java_websocket.server.WebSocketServer
-import java.net.InetSocketAddress
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString // Make sure this import is present
+import okio.ByteString.Companion.toByteString
+ // <--- ADD THIS IMPORT for the extension function
 import java.nio.ByteBuffer
-import java.util.concurrent.CopyOnWriteArrayList
-import android.graphics.Color // Needed for Color constants
+import java.util.concurrent.TimeUnit
 
-// This WebSocket server runs on the Origin app to send video frames and commands to connected Remote apps.
-class VideoWebSocketServer(port: Int, private val context: Context) : WebSocketServer(InetSocketAddress(port)) {
+class WebSocketClientManager(
+    private val remoteIp: String,
+    private val remotePort: Int,
+    private val listener: WebSocketConnectionListener?
+) {
 
-    // Store connected clients to send data to all of them
-    private val connectedClients = CopyOnWriteArrayList<WebSocket>()
+    private var client: OkHttpClient = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS) // Disable read timeout for streaming
+        .build()
+    private var webSocket: WebSocket? = null
+
+    // This property will track if the WebSocket is currently connected.
+    fun isConnected(): Boolean {
+        return webSocket != null && webSocket!!.send("") // Send a dummy message to check if connected, or maintain a state variable
+        // A more robust way is to manage connection state via onOpen/onClosed/onFailure callbacks
+        // For simplicity, we'll assume if webSocket is not null and hasn't explicitly closed, it's 'connected' for this check.
+        // Or, you can add a private var isCurrentlyConnected = AtomicBoolean(false) and update it in callbacks.
+    }
+
+
+    interface WebSocketConnectionListener {
+        fun onConnected()
+        fun onDisconnected(code: Int, reason: String)
+        fun onMessage(text: String)
+        fun onMessage(bytes: ByteBuffer)
+        fun onFailure(t: Throwable, response: Response?)
+    }
+
+    fun connect() {
+        val request = Request.Builder().url("ws://$remoteIp:$remotePort").build()
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.d(TAG, "Connected to Remote")
+                // (Optional) If you added an AtomicBoolean for connection state:
+                // isCurrentlyConnected.set(true)
+                listener?.onConnected()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.d(TAG, "Received text: $text")
+                listener?.onMessage(text)
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                Log.d(TAG, "Received bytes: ${bytes.size}")
+                listener?.onMessage(bytes.asByteBuffer())
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d(TAG, "Closing: $code / $reason")
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                Log.d(TAG, "Closed: $code / $reason")
+                // (Optional) If you added an AtomicBoolean for connection state:
+                // isCurrentlyConnected.set(false)
+                listener?.onDisconnected(code, reason)
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e(TAG, "Failure: ${t.message}", t)
+                // (Optional) If you added an AtomicBoolean for connection state:
+                // isCurrentlyConnected.set(false)
+                listener?.onFailure(t, response)
+            }
+        })
+    }
+
+    fun sendMessage(message: String) {
+        webSocket?.send(message)
+    }
+
+    fun sendBytes(bytes: ByteBuffer) {
+        // --- CORRECTED LINE ---
+        // Use the toByteString() extension function directly on the ByteBuffer
+        webSocket?.send(bytes.toByteString())
+        // --- END CORRECTED LINE ---
+    }
+
+    fun disconnect() {
+        webSocket?.close(NORMAL_CLOSURE_STATUS, "User initiated disconnect")
+        client.dispatcher.executorService.shutdown()
+        webSocket = null
+        // (Optional) If you added an AtomicBoolean for connection state:
+        // isCurrentlyConnected.set(false)
+    }
 
     companion object {
-        private const val TAG = "VideoWSServer"
-    }
+        private const val TAG = "WSClient"
+        private const val NORMAL_CLOSURE_STATUS = 1000
 
-    /**
-     * Checks if there is at least one active WebSocket connection.
-     * This property is used by StreamingForegroundService to decide whether to send frames.
-     */
-    val isOpen: Boolean
-        get() = !connectedClients.isEmpty()
-
-    override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
-        conn?.let {
-            connectedClients.add(it)
-            Log.i(TAG, "New client connected: ${it.remoteSocketAddress}. Total clients: ${connectedClients.size}")
-            // Send status update via LocalBroadcastManager through the context (which is the Service)
-            (context as? StreamingForegroundService)?.sendStatusUpdate("Client Connected: ${it.remoteSocketAddress}", Color.BLUE, true)
-        }
-    }
-
-    override fun onClose(conn: WebSocket?, code: Int, reason: String?, remote: Boolean) {
-        conn?.let {
-            connectedClients.remove(it)
-            Log.i(TAG, "Client disconnected: ${it.remoteSocketAddress}. Reason: $reason (Code: $code). Remaining clients: ${connectedClients.size}")
-            // Send status update via LocalBroadcastManager through the context (which is the Service)
-            (context as? StreamingForegroundService)?.sendStatusUpdate("Client Disconnected: ${it.remoteSocketAddress}", Color.RED, true)
-            if (connectedClients.isEmpty()) {
-                (context as? StreamingForegroundService)?.sendStatusUpdate("No clients connected.", Color.GRAY, true)
-            }
-        }
-    }
-
-    override fun onMessage(conn: WebSocket?, message: String?) {
-        message?.let {
-            Log.d(TAG, "Received message from client ${conn?.remoteSocketAddress}: $it")
-            // Send debug info via LocalBroadcastManager through the context (which is the Service)
-            (context as? StreamingForegroundService)?.sendDebugInfo("Remote message: $it")
-        }
-    }
-
-    override fun onMessage(conn: WebSocket?, message: ByteBuffer?) {
-        message?.let {
-            Log.d(TAG, "Received binary message from client ${conn?.remoteSocketAddress}, size: ${it.remaining()} bytes")
-            // Send debug info via LocalBroadcastManager through the context (which is the Service)
-            (context as? StreamingForegroundService)?.sendDebugInfo("Received binary message, size: ${it.remaining()} bytes")
-        }
-    }
-
-    override fun onError(conn: WebSocket?, ex: Exception?) {
-        val errorMessage = ex?.message ?: "Unknown server error"
-        Log.e(TAG, "Server error: ${conn?.remoteSocketAddress}: $errorMessage", ex)
-        // Send status update via LocalBroadcastManager through the context (which is the Service)
-        (context as? StreamingForegroundService)?.sendStatusUpdate("Server Error: ${errorMessage}", Color.RED, true)
-    }
-
-    override fun onStart() {
-        Log.i(TAG, "WebSocket Server started on port ${port}")
-        // No UI update here, as it's done in StreamingForegroundService once all setup is complete
-    }
-
-    // Method to send video frames (byte arrays) to all connected clients
-    fun sendFrameBytes(frameBytes: ByteArray) {
-        if (connectedClients.isNotEmpty()) {
-            val buffer = ByteBuffer.wrap(frameBytes)
-            connectedClients.forEach { client ->
-                if (client.isOpen) { // This checks the individual client's connection state
-                    client.send(buffer)
-                }
-            }
-        }
-    }
-
-    // Method to send playback commands (text messages) to all connected clients
-    fun sendPlaybackCommand(command: PlaybackCommand, startTimeMillis: Long = 0L, targetFps: Int = 0) {
-        val message = when (command) {
-            PlaybackCommand.PLAY -> "PLAY:$startTimeMillis:$targetFps"
-            PlaybackCommand.PAUSE -> "PAUSE"
-            PlaybackCommand.STOP -> "STOP"
-        }
-        if (connectedClients.isNotEmpty()) {
-            connectedClients.forEach { client ->
-                if (client.isOpen) { // This checks the individual client's connection state
-                    client.send(message)
-                }
-            }
-            Log.d(TAG, "Sent command to clients: $message")
-        } else {
-            Log.d(TAG, "No clients to send command to: $message")
-        }
-    }
-
-    // Method to stop the WebSocket server
-    fun stopServer() {
-        // Removed the problematic isStopping() and isStopped() checks as a workaround.
-        // The underlying stop() method of WebSocketServer can generally handle being called
-        // even if the server is already in a stopping or stopped state.
-        Log.i(TAG, "Stopping WebSocket Server...")
-        try {
-            // Close all connected clients first
-            connectedClients.forEach { it.close() }
-            connectedClients.clear()
-            // Then stop the server itself
-            this.stop()
-            Log.i(TAG, "WebSocket Server stopped.")
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Error stopping WebSocket Server: ${e.message}", e)
-            Thread.currentThread().interrupt() // Restore interrupt status
-        } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error during server stop: ${e.message}", e)
-        }
+        // Define control commands
+        const val COMMAND_START_STREAMING = "START_STREAM"
+        const val COMMAND_STOP_STREAMING = "STOP_STREAM"
     }
 }

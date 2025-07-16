@@ -1,256 +1,227 @@
-package com.example.origin
+// StreamingForegroundService.kt (Origin App)
+package com.example.origin // Ensure this matches your manifest package
 
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Color
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.media.Image
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
-import android.view.Surface
 import androidx.core.app.NotificationCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import kotlinx.coroutines.*
-import java.io.ByteArrayOutputStream
-import java.net.BindException
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.min // Import min for Math.min replacement
+import androidx.localbroadcastmanager.content.LocalBroadcastManager // Import for LocalBroadcastManager
+import com.example.originapp.MediaStreamer
+import com.example.originapp.WebSocketClientManager
+import java.nio.ByteBuffer
 
-// This service manages the WebSocket server, video frame extraction, and local playback.
-class StreamingForegroundService : Service() {
+// This service will run in the foreground to handle video/audio streaming
+class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketConnectionListener {
 
-    private var videoWebSocketServer: VideoWebSocketServer? = null
-    private var localDisplaySurface: Surface? = null // Surface from MainActivity for local playback
-
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    // State flags for video processing and playback
-    private val isVideoProcessingInProgress = AtomicBoolean(false) // True when the main video pipeline is active
-    private val isTransferringInProgress = AtomicBoolean(false) // True when sending frames to remote
-    private val isPlaybackActive = AtomicBoolean(false) // True when local playback is ongoing
-    private val isPlaybackPaused = AtomicBoolean(false) // True if playback is paused
-
-    // Unified MediaCodec components for both local display and remote capture
-    private var mediaExtractor: MediaExtractor? = null
-    private var videoDecoder: MediaCodec? = null
-    private var imageReaderForRemote: android.media.ImageReader? = null // ImageReader to capture frames for remote
-    private var imageReaderSurface: Surface? = null // Surface created from ImageReader
-
-    // HandlerThread for ImageReader callbacks
-    private var imageReaderHandlerThread: HandlerThread? = null
-    private var imageReaderHandler: Handler? = null
-
-    private var playbackStartTimeMillis: Long = 0L // For synchronized playback
-
-    private var videoWidth: Int = 0 // Will be determined from video format
-    private var videoHeight: Int = 0 // Will be determined from video format
-    private var targetFps: Int = 20 // Default FPS, will be updated from video format, but we'll cap it
-
-    private val desiredOutputFps = 10 // FURTHER REDUCED: Target output FPS for remote streaming
-    private var frameIntervalMillis = 1000L / desiredOutputFps // Milliseconds per frame for desired FPS
-
-    private var videoTrackIndex: Int = -1 // Store the selected video track index
-
-    companion object {
-        private const val TAG = "StreamingFService"
-        private const val NOTIFICATION_CHANNEL_ID = "VideoStreamingChannel"
-        private const val NOTIFICATION_ID = 101
-        private const val JPEG_QUALITY = 40 // FURTHER REDUCED: Quality for compressing Bitmaps to JPEG
-        // Actions for starting/stopping video processing (extraction & transfer)
-        const val ACTION_START_VIDEO_PROCESSING = "com.example.origin.ACTION_START_VIDEO_PROCESSING"
-        const val ACTION_STOP_VIDEO_PROCESSING = "com.example.origin.ACTION_STOP_VIDEO_PROCESSING"
-        // Actions for local Surface management
-        const val ACTION_SET_LOCAL_SURFACE = "com.example.origin.ACTION_SET_LOCAL_SURFACE"
-        const val ACTION_CLEAR_LOCAL_SURFACE = "com.example.origin.ACTION_CLEAR_LOCAL_SURFACE"
-        const val EXTRA_SURFACE = "surface_object" // Key for passing Surface
-        // Video resource ID (e.e., R.raw.sample_video)
-        const val EXTRA_VIDEO_RES_ID = "video_resource_id"
-        // Playback commands (already defined as enum, but for clarity in actions)
-        const val ACTION_PLAY_VIDEO = "com.example.origin.ACTION_PLAY_VIDEO"
-        const val ACTION_PAUSE_VIDEO = "com.example.origin.ACTION_PAUSE_VIDEO"
-    }
+    private var wsClient: WebSocketClientManager? = null
+    private var mediaStreamer: MediaStreamer? = null
+    private var streamingUri: Uri? = null
+    private var remoteIpAddress: String? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "Service onCreate")
-        createNotificationChannel() // Ensure channel is created
-
-        // Initialize HandlerThread for ImageReader
-        imageReaderHandlerThread = HandlerThread("ImageReaderThread").apply { start() }
-        imageReaderHandler = Handler(imageReaderHandlerThread!!.looper)
+        Log.d(TAG, "StreamingForegroundService created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "Service onStartCommand: ${intent?.action}")
+        Log.d(TAG, "StreamingForegroundService onStartCommand")
 
-        when (intent?.action) {
-            ACTION_START_VIDEO_PROCESSING -> {
-                if (isVideoProcessingInProgress.get()) {
-                    Log.w(TAG, "Video processing already in progress. Ignoring START command.")
-                    sendStatusUpdate("Service already active.", Color.YELLOW, true)
-                    return START_NOT_STICKY
-                }
-                startForeground(NOTIFICATION_ID, createNotification("Processing video..."))
-                startVideoProcessingAndStreaming()
-            }
-            ACTION_STOP_VIDEO_PROCESSING -> {
-                stopVideoProcessingAndStreaming()
-            }
-            ACTION_SET_LOCAL_SURFACE -> {
-                val surface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent?.getParcelableExtra(EXTRA_SURFACE, Surface::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent?.getParcelableExtra(EXTRA_SURFACE)
-                }
+        createNotificationChannel()
 
-                if (surface != null) {
-                    localDisplaySurface = surface
-                    Log.d(TAG, "Local display surface set.")
-                    // If video processing is active, reconfigure decoder with new surface
-                    if (isVideoProcessingInProgress.get() && videoDecoder != null && videoTrackIndex != -1) {
-                        Log.d(TAG, "Video processing active, reconfiguring decoder with new surface.")
-                        reconfigureDecoderSurface()
-                    }
-                } else {
-                    Log.e(TAG, "Received null surface via ACTION_SET_LOCAL_SURFACE.")
-                }
-            }
-            ACTION_CLEAR_LOCAL_SURFACE -> {
-                Log.d(TAG, "Clearing local display surface.")
-                localDisplaySurface = null
-                // If video processing is active, stop it as display is gone
-                if (isVideoProcessingInProgress.get()) {
-                    Log.d(TAG, "Surface cleared, stopping video processing.")
-                    stopVideoProcessingAndStreaming()
-                }
-            }
-            ACTION_PLAY_VIDEO -> {
-                controlPlayback(PlaybackCommand.PLAY)
-            }
-            ACTION_PAUSE_VIDEO -> {
-                controlPlayback(PlaybackCommand.PAUSE)
-            }
-            MainActivity.ACTION_STOP_PLAYBACK -> {
-                controlPlayback(PlaybackCommand.STOP)
-            }
-            else -> {
-                Log.d(TAG, "Unhandled intent action: ${intent?.action}")
-            }
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Streaming in Progress")
+            .setContentText("Connecting to remote...")
+            .setSmallIcon(androidx.appcompat.R.drawable.notification_icon_background) // IMPORTANT: Change this icon to your app's icon, e.g., R.mipmap.ic_launcher
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+
+        // Get data (MP4 URI and Remote IP) from the intent that started the service
+        streamingUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_MP4_URI, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION") // For older Android versions (API < 33)
+            intent?.getParcelableExtra(EXTRA_MP4_URI)
+        }
+        remoteIpAddress = intent?.getStringExtra(EXTRA_REMOTE_IP)
+
+        if (streamingUri == null || remoteIpAddress == null) {
+            Log.e(TAG, "Missing MP4 URI or IP address for streaming. Stopping service.")
+            updateNotification("Error: Missing stream data.")
+            sendStatusBroadcast("Error: Missing stream data.", android.graphics.Color.RED, false)
+            stopSelf() // Stop the service if essential data is missing
+            return START_NOT_STICKY
+        }
+
+        // Initialize and connect WebSocket client
+        // Only connect if not already connected or if the client needs re-initialization
+        if (wsClient == null || wsClient?.isConnected() == false) {
+            wsClient = WebSocketClientManager(remoteIpAddress!!, 8080, this)
+            wsClient?.connect()
+            updateNotification("Connecting to Remote: $remoteIpAddress")
+            sendStatusBroadcast("Connecting to Remote: $remoteIpAddress", android.graphics.Color.GRAY, true)
+        } else {
+            // This might happen if the service is restarted by the system and WS is still connected
+            Log.d(TAG, "WebSocket already connected, attempting to start MediaStreamer directly.")
+            startMediaStreamerIfReady()
         }
 
         return START_NOT_STICKY
     }
 
-    private fun startVideoProcessingAndStreaming() {
-        serviceScope.launch {
-            isVideoProcessingInProgress.set(true)
-            isPlaybackActive.set(true) // Playback is active as soon as processing starts
-            isPlaybackPaused.set(false)
-            sendStatusUpdate("Starting server and video stream...", Color.parseColor("#FFA500"), true)
-            updateNotification("Streaming video...")
+    override fun onBind(intent: Intent?): IBinder? {
+        // This service is not designed for binding, so return null
+        return null
+    }
 
-            try {
-                // 1. Initialize and start WebSocket server
-                Log.d(TAG, "Attempting to start WebSocket server.")
-                try {
-                    videoWebSocketServer = VideoWebSocketServer(port = 8080, context = applicationContext)
-                    videoWebSocketServer?.start()
-                    sendStatusUpdate("Server started. Initializing video...", Color.parseColor("#FFA500"), true)
-                    Log.d(TAG, "WebSocket server started successfully.")
-                } catch (e: BindException) {
-                    Log.e(TAG, "WebSocket Error: Address already in use on port 8080. Please ensure no other instance is running.", e)
-                    sendStatusUpdate("Error: Port 8080 already in use. Restart app.", Color.RED, false)
-                    return@launch // Exit coroutine
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error starting WebSocket server: ${e.message}", e)
-                    sendStatusUpdate("Error starting server: ${e.message}", Color.RED, false)
-                    return@launch // Exit coroutine
-                }
+    override fun onDestroy() {
+        Log.d(TAG, "StreamingForegroundService onDestroy")
+        mediaStreamer?.stopStreaming() // Stop the streamer first
+        wsClient?.disconnect() // Disconnect WebSocket
+        super.onDestroy()
+        stopForeground(STOP_FOREGROUND_REMOVE) // Remove the foreground notification
+        sendStatusBroadcast("Stream Stopped.", android.graphics.Color.BLACK, false) // Final status update
+    }
 
-                // 2. Initialize MediaExtractor and MediaCodec
-                val videoUri = Uri.parse("android.resource://" + packageName + "/" + R.raw.sample_video)
-                Log.d(TAG, "Setting up MediaExtractor for URI: $videoUri")
-                mediaExtractor = MediaExtractor()
-                try {
-                    mediaExtractor?.setDataSource(applicationContext, videoUri, null)
-                    Log.d(TAG, "MediaExtractor data source set successfully.")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error setting MediaExtractor data source: ${e.message}", e)
-                    sendStatusUpdate("Error: Could not load video source. Check R.raw.sample_video exists and is valid.", Color.RED, false)
-                    return@launch
-                }
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val serviceChannel = NotificationChannel(
+                CHANNEL_ID,
+                "Live Streaming Service Channel", // User-visible name
+                NotificationManager.IMPORTANCE_LOW // Low importance notification
+            )
+            val manager = getSystemService(NotificationManager::class.java) as NotificationManager
+            manager.createNotificationChannel(serviceChannel)
+        }
+    }
 
+    private fun updateNotification(content: String) {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Streaming in Progress")
+            .setContentText(content)
+            .setSmallIcon(androidx.appcompat.R.drawable.notification_icon_background) // IMPORTANT: Change this icon!
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
 
-                var foundVideoTrackIndex = -1 // Use a local variable for initial discovery
-                Log.d(TAG, "Searching for video track. Total tracks: ${mediaExtractor?.trackCount ?: 0}")
-                for (i in 0 until (mediaExtractor?.trackCount ?: 0)) {
-                    val format = mediaExtractor?.getTrackFormat(i)
-                    val mime = format?.getString(MediaFormat.KEY_MIME)
-                    Log.d(TAG, "Track $i: MIME = $mime")
-                    if (mime?.startsWith("video/") == true) {
-                        foundVideoTrackIndex = i
-                        mediaExtractor?.selectTrack(foundVideoTrackIndex)
-                        videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
-                        videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
-                        targetFps = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                            format.getInteger(MediaFormat.KEY_FRAME_RATE)
-                        } else {
-                            20 // Default if not specified
-                        }
-                        Log.d(TAG, "Video track found at index $foundVideoTrackIndex: ${videoWidth}x${videoHeight} @ ${targetFps} FPS")
-                        break
-                    }
-                }
-                videoTrackIndex = foundVideoTrackIndex // Assign to class-level variable
+    private fun startMediaStreamerIfReady() {
+        // Only start MediaStreamer if WebSocket is connected, URI and IP are present, and streamer is not already running
+        if (wsClient?.isConnected() == true && streamingUri != null && mediaStreamer == null) {
+            mediaStreamer = MediaStreamer(applicationContext, streamingUri!!, wsClient!!)
+            mediaStreamer?.startStreaming()
+            updateNotification("Streaming to: ${remoteIpAddress}")
+            sendStatusBroadcast("Streaming to: ${remoteIpAddress}", android.graphics.Color.GREEN, true)
+            Log.d(TAG, "MediaStreamer started.")
+        } else {
+            Log.w(TAG, "Cannot start MediaStreamer. WS connected: ${wsClient?.isConnected()}, URI present: ${streamingUri != null}, Streamer null: ${mediaStreamer == null}")
+        }
+    }
 
-                if (videoTrackIndex == -1) {
-                    Log.e(TAG, "No video track found in the provided URI.")
-                    sendStatusUpdate("Error: No video track found in video file. Is it a valid video?", Color.RED, false)
-                    return@launch
-                }
+    // Helper to send status updates to MainActivity via LocalBroadcastManager
+    private fun sendStatusBroadcast(message: String, color: Int, isRunning: Boolean) {
+        val intent = Intent(ACTION_STATUS_UPDATE).apply {
+            putExtra(EXTRA_MESSAGE, message)
+            putExtra(EXTRA_COLOR, color)
+            putExtra(EXTRA_IS_RUNNING, isRunning)
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
 
-                val format = mediaExtractor?.getTrackFormat(videoTrackIndex) ?: run {
-                    Log.e(TAG, "MediaFormat is null after selecting track.")
-                    sendStatusUpdate("Error: Invalid video format after track selection.", Color.RED, false)
-                    return@launch
-                }
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: run {
-                    Log.e(TAG, "MIME type is null from video format.")
-                    sendStatusUpdate("Error: Invalid video MIME type.", Color.RED, false)
-                    return@launch
-                }
+    // Helper to send debug info to MainActivity via LocalBroadcastManager
+    private fun sendDebugBroadcast(message: String) {
+        val intent = Intent(ACTION_DEBUG_INFO).apply {
+            putExtra(EXTRA_MESSAGE, message)
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
 
-                // Create ImageReader for capturing frames for remote
-                Log.d(TAG, "Creating ImageReader for remote capture: ${videoWidth}x${videoHeight}, format: YUV_420_888")
-                imageReaderForRemote = android.media.ImageReader.newInstance(
-                    videoWidth, videoHeight,
-                    ImageFormat.YUV_420_888, // Capture YUV for potential smaller size or specific remote needs
-                    8 // Increased buffer size from 2 to 8 to prevent image recycling issues
-                )
-                imageReaderSurface = imageReaderForRemote?.surface
-                if (imageReaderSurface == null) {
-                    Log.e(TAG, "ImageReader surface is null. Failed to create ImageReader.")
-                    sendStatusUpdate("Error: ImageReader surface creation failed.", Color.RED, false)
-                    return@launch
-                }
-                Log.d(TAG, "ImageReader and its surface created successfully.")
+    // --- WebSocketConnectionListener implementation (from WebSocketClientManager) ---
+    override fun onConnected() {
+        Log.d(TAG, "WebSocket Connected within service.")
+        startMediaStreamerIfReady() // Attempt to start streaming once connected
+    }
 
-                // Set up ImageReader listener to send frames to remote AND draw to local display
-                // Pass the handler to ensure callbacks are on the HandlerThread
-                Log.d(TAG, "Setting up ImageReader OnImageAvailableListener with handler.")
-                imageReaderForRemote?.setOnImageAvailableListe
+    override fun onDisconnected(code: Int, reason: String) {
+        Log.d(TAG, "WebSocket Disconnected within service: $reason (Code: $code)")
+        updateNotification("Disconnected: $reason")
+        sendStatusBroadcast("Disconnected: $reason (Code: $code)", android.graphics.Color.RED, false)
+        mediaStreamer?.stopStreaming() // Ensure media streamer stops
+        mediaStreamer = null
+        stopSelf() // Stop the service itself on disconnect
+    }
+
+    override fun onMessage(text: String) {
+        Log.d(TAG, "Received text from Remote: $text")
+        // Handle any text messages from Remote if necessary
+        sendDebugBroadcast("Remote: $text") // Forward to UI as debug info
+    }
+
+    override fun onMessage(bytes: ByteBuffer) {
+        Log.d(TAG, "Received bytes from Remote: ${bytes.remaining()} bytes")
+        // Handle any binary data from Remote if necessary
+        sendDebugBroadcast("Remote: Received ${bytes.remaining()} bytes") // Forward to UI as debug info
+    }
+
+    override fun onFailure(t: Throwable, response: okhttp3.Response?) {
+        Log.e(TAG, "WebSocket connection failed within service", t)
+        updateNotification("Connection Failed: ${t.message}")
+        sendStatusBroadcast("Connection Failed: ${t.message}", android.graphics.Color.RED, false)
+        mediaStreamer?.stopStreaming() // Ensure media streamer stops
+        mediaStreamer = null
+        stopSelf() // Stop the service itself on connection failure
+    }
+
+    companion object {
+        private const val TAG = "StreamingFGService"
+        private const val CHANNEL_ID = "LiveStreamChannel" // Unique ID for notification channel
+        private const val NOTIFICATION_ID = 101 // Unique ID for the foreground notification
+
+        // Intent extras for passing data to the service
+        const val EXTRA_MP4_URI = "com.example.origin.EXTRA_MP4_URI"
+        const val EXTRA_REMOTE_IP = "com.example.origin.EXTRA_REMOTE_IP"
+
+        // Actions for broadcast intents (for MainActivity to listen to)
+        const val ACTION_STATUS_UPDATE = "com.example.origin.STATUS_UPDATE"
+        const val ACTION_DEBUG_INFO = "com.example.origin.DEBUG_INFO"
+
+        // Extras for broadcast intents
+        const val EXTRA_MESSAGE = "message"
+        const val EXTRA_COLOR = "color"
+        const val EXTRA_IS_RUNNING = "isRunning"
+
+        /**
+         * Helper method to start the StreamingForegroundService from an Activity or other component.
+         * Passes the MP4 URI and Remote IP address to the service.
+         */
+        fun start(context: Context, mp4Uri: Uri, remoteIp: String) {
+            val intent = Intent(context, StreamingForegroundService::class.java).apply {
+                putExtra(EXTRA_MP4_URI, mp4Uri)
+                putExtra(EXTRA_REMOTE_IP, remoteIp)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+            Log.d(TAG, "Attempting to start StreamingForegroundService from Activity.")
+        }
+
+        /**
+         * Helper method to stop the StreamingForegroundService.
+         */
+        fun stop(context: Context) {
+            val intent = Intent(context, StreamingForegroundService::class.java)
+            context.stopService(intent)
+            Log.d(TAG, "Attempting to stop StreamingForegroundService from Activity.")
+        }
+    }
+}

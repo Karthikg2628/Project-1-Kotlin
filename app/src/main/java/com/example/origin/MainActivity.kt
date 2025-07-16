@@ -1,328 +1,174 @@
-package com.example.origin
+// MainActivity.kt (Origin App)
+package com.example.originapp
 
-import android.app.Activity
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.graphics.Color
-import android.media.projection.MediaProjectionManager
-import android.os.Build
+import android.database.Cursor
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.widget.Button
 import android.widget.TextView
-import androidx.activity.result.ActivityResultLauncher
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import java.net.Inet4Address
-import java.net.NetworkInterface
-import java.util.*
+import com.example.origin.R
+import java.io.IOException
+import java.nio.ByteBuffer
 
-// Direct import for the StreamingForegroundService class itself
-import com.example.origin.StreamingForegroundService
+class MainActivity : AppCompatActivity(), WebSocketClientManager.WebSocketConnectionListener {
 
-// Static imports for companion object members for direct access
-import com.example.origin.StreamingForegroundService.Companion.ACTION_START_VIDEO_PROCESSING
-import com.example.origin.StreamingForegroundService.Companion.ACTION_STOP_VIDEO_PROCESSING
-import com.example.origin.StreamingForegroundService.Companion.ACTION_SET_LOCAL_SURFACE
-import com.example.origin.StreamingForegroundService.Companion.ACTION_CLEAR_LOCAL_SURFACE
-import com.example.origin.StreamingForegroundService.Companion.EXTRA_SURFACE
+    private lateinit var textViewFileName: TextView
+    private lateinit var textViewStatus: TextView
+    private lateinit var buttonSelectMp4: Button
+    private lateinit var buttonStream: Button
+    private lateinit var buttonStopStream: Button
+    private lateinit var editTextRemoteIp: TextView // Consider EditText for input
 
+    private var selectedMp4Uri: Uri? = null
+    private lateinit var wsClient: WebSocketClientManager
+    private var mediaStreamer: MediaStreamer? = null
 
-class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
-
-    private lateinit var connectionStatus: TextView // This will be used for main status updates
-    private lateinit var debugInfo: TextView       // This will be used for debug messages
-    private lateinit var startButton: Button
-    private lateinit var stopButton: Button
-    private lateinit var playButton: Button
-    private lateinit var pauseButton: Button
-    private lateinit var stopPlaybackButton: Button
-    private lateinit var localVideoSurface: SurfaceView
-
-    private var mediaProjectionManager: MediaProjectionManager? = null
-    private var mediaProjectionLauncher: ActivityResultLauncher<Intent>? = null
-
-    private var isServiceRunning = false // Track service state
-
-    companion object {
-        private const val TAG = "OriginMainActivity"
-        private const val DEBUG_INFO_MAX_LENGTH = 500 // Increased length for more debug info
-
-        // Define broadcast actions for service communication
-        const val ACTION_STATUS_UPDATE = "com.example.origin.STATUS_UPDATE"
-        const val EXTRA_STATUS_MESSAGE = "status_message"
-        const val EXTRA_STATUS_COLOR = "status_color"
-        const val EXTRA_IS_RUNNING = "is_running" // For server/transfer status
-
-        const val ACTION_DEBUG_INFO = "com.example.origin.DEBUG_INFO"
-        const val EXTRA_DEBUG_MESSAGE = "debug_message"
-
-        // New actions for playback control
-        const val ACTION_PLAY_VIDEO = "com.example.origin.ACTION_PLAY_VIDEO"
-        const val ACTION_PAUSE_VIDEO = "com.example.origin.ACTION_PAUSE_VIDEO"
-        const val ACTION_STOP_PLAYBACK = "com.example.origin.ACTION_STOP_PLAYBACK"
-        const val ACTION_VIDEO_READY = "com.example.origin.ACTION_VIDEO_READY" // Sent by service when frames are ready for playback
-        const val ACTION_PLAYBACK_STATE_UPDATE = "com.example.origin.ACTION_PLAYBACK_STATE_UPDATE"
-        const val EXTRA_PLAYBACK_STATE = "playback_state" // e.g., "playing", "paused", "stopped"
-    }
-
-    // BroadcastReceiver to receive updates from the service
-    private val serviceStatusReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ACTION_STATUS_UPDATE -> {
-                    val message = intent.getStringExtra(EXTRA_STATUS_MESSAGE) ?: "Unknown status"
-                    val color = intent.getIntExtra(EXTRA_STATUS_COLOR, Color.BLACK)
-                    val running = intent.getBooleanExtra(EXTRA_IS_RUNNING, false)
-                    updateUI {
-                        updateConnectionStatus(message, color)
-                        isServiceRunning = running
-                        startButton.isEnabled = !running
-                        stopButton.isEnabled = running
-                        // Playback buttons remain disabled until video is ready
-                    }
-                }
-                ACTION_DEBUG_INFO -> {
-                    val message = intent.getStringExtra(EXTRA_DEBUG_MESSAGE) ?: ""
-                    updateUI { appendDebugInfo(message) } // Changed to appendDebugInfo
-                }
-                ACTION_VIDEO_READY -> {
-                    updateUI {
-                        updateConnectionStatus("Video frames ready for playback!", Color.MAGENTA)
-                        playButton.isEnabled = true
-                        pauseButton.isEnabled = false // Initially paused/stopped
-                        stopPlaybackButton.isEnabled = false // Enabled only when playing
-                    }
-                }
-                ACTION_PLAYBACK_STATE_UPDATE -> {
-                    val state = intent.getStringExtra(EXTRA_PLAYBACK_STATE)
-                    updateUI {
-                        when (state) {
-                            "playing" -> {
-                                playButton.isEnabled = false
-                                pauseButton.isEnabled = true
-                                stopPlaybackButton.isEnabled = true
-                                updateConnectionStatus("Playing video...", Color.GREEN)
-                            }
-                            "paused" -> {
-                                playButton.isEnabled = true
-                                pauseButton.isEnabled = false
-                                stopPlaybackButton.isEnabled = true
-                                updateConnectionStatus("Video paused.", Color.BLUE)
-                            }
-                            "stopped" -> {
-                                playButton.isEnabled = true
-                                pauseButton.isEnabled = false
-                                stopPlaybackButton.isEnabled = false
-                                updateConnectionStatus("Video playback stopped.", Color.GRAY)
-                            }
-                        }
-                    }
-                }
-            }
+    // Activity Result API for file selection
+    private val pickMp4File = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            selectedMp4Uri = uri
+            textViewFileName.text = "Selected: ${getFileName(uri)}"
+            buttonStream.isEnabled = true // Enable stream button once file is selected
+        } else {
+            textViewFileName.text = "No file selected"
+            buttonStream.isEnabled = false
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        setContentView(R.layout.activity_main) // You'll create this layout
 
-        initViews()
-        setupButtonListeners()
-        initializeMediaProjection()
+        textViewFileName = findViewById(R.id.textViewFileName)
+        textViewStatus = findViewById(R.id.textViewStatus)
+        buttonSelectMp4 = findViewById(R.id.buttonSelectMp4)
+        buttonStream = findViewById(R.id.buttonStream)
+        buttonStopStream = findViewById(R.id.buttonStopStream)
+        editTextRemoteIp = findViewById(R.id.editTextRemoteIp) // Assuming ID
 
-        // Setup SurfaceHolder callback
-        localVideoSurface.holder.addCallback(this)
+        buttonStream.isEnabled = false // Disable initially
+        buttonStopStream.isEnabled = false
 
-        // Register the broadcast receiver
-        val filter = IntentFilter().apply {
-            addAction(ACTION_STATUS_UPDATE)
-            addAction(ACTION_DEBUG_INFO)
-            addAction(ACTION_VIDEO_READY)
-            addAction(ACTION_PLAYBACK_STATE_UPDATE)
+        buttonSelectMp4.setOnClickListener {
+            pickMp4File.launch("video/mp4")
         }
-        LocalBroadcastManager.getInstance(this).registerReceiver(serviceStatusReceiver, filter)
 
-        updateConnectionStatus("App Ready. IP: ${getLocalIpAddress() ?: "N/A"}", Color.parseColor("#0000FF"))
+        buttonStream.setOnClickListener {
+            selectedMp4Uri?.let { uri ->
+                val ipAddress = editTextRemoteIp.text.toString().trim()
+                if (ipAddress.isBlank()) {
+                    Toast.makeText(this, "Please enter Remote IP address", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                startStreaming(uri, ipAddress)
+            } ?: run {
+                Toast.makeText(this, "Please select an MP4 file first", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        buttonStopStream.setOnClickListener {
+            stopStreaming()
+        }
+
+        // Initialize WebSocket client (can be done earlier, but connect on stream start)
+        // For demonstration, let's assume a default IP for testing or get it from EditText
+        // wsClient = WebSocketClientManager("192.168.1.100", 8080, this)
     }
 
-    private fun initViews() {
-        connectionStatus = findViewById(R.id.connectionStatus)
-        debugInfo = findViewById(R.id.debugInfo)
-        startButton = findViewById(R.id.startButton)
-        stopButton = findViewById(R.id.stopButton)
-        playButton = findViewById(R.id.playButton)
-        pauseButton = findViewById(R.id.pauseButton)
-        stopPlaybackButton = findViewById(R.id.stopPlaybackButton)
-        localVideoSurface = findViewById(R.id.localVideoSurface)
-
-        stopButton.isEnabled = false // Disable stop button initially
-        playButton.isEnabled = false
-        pauseButton.isEnabled = false
-        stopPlaybackButton.isEnabled = false
-    }
-
-    private fun setupButtonListeners() {
-        startButton.setOnClickListener {
-            startVideoProcessingAndTransferService()
-        }
-        stopButton.setOnClickListener {
-            stopVideoProcessingAndTransferService()
-        }
-        playButton.setOnClickListener {
-            sendPlaybackCommand(ACTION_PLAY_VIDEO)
-        }
-        pauseButton.setOnClickListener {
-            sendPlaybackCommand(ACTION_PAUSE_VIDEO)
-        }
-        stopPlaybackButton.setOnClickListener {
-            sendPlaybackCommand(ACTION_STOP_PLAYBACK)
-        }
-    }
-
-    private fun initializeMediaProjection() {
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            // This callback won't be triggered for file-based video.
-        }
-    }
-
-    private fun startVideoProcessingAndTransferService() {
-        if (isServiceRunning) {
-            Log.w(TAG, "Video processing/transfer service is already running.")
+    private fun startStreaming(mp4Uri: Uri, remoteIp: String) {
+        if (mediaStreamer != null && mediaStreamer?.isStreaming?.get() == true) {
+            Toast.makeText(this, "Already streaming!", Toast.LENGTH_SHORT).show()
             return
         }
 
-        updateUI { updateConnectionStatus("Starting Video Processing Service...", Color.parseColor("#FFA500")) }
+        wsClient = WebSocketClientManager(remoteIp, 8080, this) // Port 8080 assumed for Remote
+        wsClient.connect()
+        textViewStatus.text = "Connecting to Remote..."
+        buttonStream.isEnabled = false
+        buttonStopStream.isEnabled = true
 
-        val serviceIntent = Intent(this, StreamingForegroundService::class.java).apply {
-            action = ACTION_START_VIDEO_PROCESSING
-            putExtra(StreamingForegroundService.EXTRA_VIDEO_RES_ID, R.raw.sample_video) // Pass your video resource ID
-        }
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Video Processing Service", e)
-            updateUI { updateConnectionStatus("Error starting service: ${e.message}", Color.RED) }
-        }
+        // MediaStreamer will be started on WebSocket connection `onConnected`
     }
 
-    private fun stopVideoProcessingAndTransferService() {
-        if (!isServiceRunning) {
-            Log.w(TAG, "Video processing/transfer service is not running.")
-            return
-        }
-
-        updateUI { updateConnectionStatus("Stopping Video Processing Service...", Color.parseColor("#FFA500")) }
-        val serviceIntent = Intent(this, StreamingForegroundService::class.java).apply {
-            action = ACTION_STOP_VIDEO_PROCESSING
-        }
-        stopService(serviceIntent)
+    private fun stopStreaming() {
+        mediaStreamer?.stopStreaming()
+        wsClient.disconnect()
+        textViewStatus.text = "Stream Stopped."
+        buttonStream.isEnabled = true
+        buttonStopStream.isEnabled = false
     }
 
-    private fun sendPlaybackCommand(action: String) {
-        val intent = Intent(this, StreamingForegroundService::class.java).apply {
-            this.action = action
-        }
-        startService(intent) // Send command to running service
-    }
-
-    override fun onPause() {
-        super.onPause()
-        // Consider pausing video playback if app goes to background
-        // sendPlaybackCommand(ACTION_PAUSE_VIDEO)
-    }
-
-    override fun onDestroy() {
-        // Unregister the broadcast receiver
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(serviceStatusReceiver)
-
-        // Ensure the service is stopped when the activity is completely destroyed
-        stopVideoProcessingAndTransferService()
-        super.onDestroy()
-    }
-
-    private fun getLocalIpAddress(): String? {
-        return try {
-            Collections.list(NetworkInterface.getNetworkInterfaces())
-                .filter { it.isUp && !it.isLoopback }
-                .flatMap { Collections.list(it.inetAddresses) }
-                .firstOrNull { it is Inet4Address }?.hostAddress
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting local IP address", e)
-            null
-        }
-    }
-
-    private fun updateUI(action: () -> Unit) {
-        if (!isFinishing && !isDestroyed) {
-            runOnUiThread(action)
-        }
-    }
-
-    // Consolidated method for connection status updates
-    private fun updateConnectionStatus(message: String, color: Int? = null) {
-        if (::connectionStatus.isInitialized) {
-            connectionStatus.text = message
-            color?.let { connectionStatus.setTextColor(it) }
-        }
-    }
-
-    // Consolidated method for appending debug info
-    private fun appendDebugInfo(message: String) {
-        if (::debugInfo.isInitialized) {
-            val currentText = debugInfo.text.toString()
-            val newText = if (currentText.isEmpty()) message else "$currentText\n$message"
-
-            // Trim to max length to prevent OOM
-            debugInfo.text = if (newText.length > DEBUG_INFO_MAX_LENGTH) {
-                newText.substring(newText.length - DEBUG_INFO_MAX_LENGTH)
-            } else {
-                newText
-            }
-
-            // Scroll to bottom
-            debugInfo.post {
-                val scrollAmount = debugInfo.layout?.getLineTop(debugInfo.lineCount)!! - debugInfo.height
-                if (scrollAmount > 0) {
-                    debugInfo.scrollTo(0, scrollAmount)
+    // Helper to get file name from Uri
+    private fun getFileName(uri: Uri): String {
+        var result: String? = null
+        if (uri.scheme == "content") {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex != -1) {
+                        result = cursor.getString(nameIndex)
+                    }
                 }
             }
         }
-    }
-
-    // --- SurfaceHolder.Callback methods ---
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        Log.d(TAG, "Surface created. Notifying service.")
-        // Send the Surface to the service so it can render video frames to it
-        val serviceIntent = Intent(this, StreamingForegroundService::class.java).apply {
-            action = ACTION_SET_LOCAL_SURFACE
-            putExtra(EXTRA_SURFACE, holder.surface)
+        if (result == null) {
+            result = uri.path
+            val cut = result?.lastIndexOf('/') ?: -1
+            if (cut != -1) {
+                result = result?.substring(cut + 1)
+            }
         }
-        startService(serviceIntent) // Send command to running service
+        return result ?: "Unknown File"
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        Log.d(TAG, "Surface changed: width=$width, height=$height")
-        // You might want to notify the service of size changes if it needs to adjust rendering
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.d(TAG, "Surface destroyed. Notifying service.")
-        // Notify the service that the surface is no longer valid
-        val serviceIntent = Intent(this, StreamingForegroundService::class.java).apply {
-            action = ACTION_CLEAR_LOCAL_SURFACE
+    // --- WebSocketConnectionListener implementation ---
+    override fun onConnected() {
+        runOnUiThread {
+            textViewStatus.text = "Connected to Remote."
+            // Start streaming only after WebSocket is connected
+            selectedMp4Uri?.let { uri ->
+                mediaStreamer = MediaStreamer(applicationContext, uri, wsClient)
+                mediaStreamer?.startStreaming()
+                Toast.makeText(this, "Streaming started!", Toast.LENGTH_SHORT).show()
+            }
         }
-        startService(serviceIntent) // Send command to running service
+    }
+
+    override fun onDisconnected(code: Int, reason: String) {
+        runOnUiThread {
+            textViewStatus.text = "Disconnected: $reason (Code: $code)"
+            buttonStream.isEnabled = true
+            buttonStopStream.isEnabled = false
+            mediaStreamer?.stopStreaming() // Ensure streamer also stops
+            mediaStreamer = null
+        }
+    }
+
+    override fun onMessage(text: String) {
+        Log.d("OriginApp", "Received text from Remote: $text")
+        // Handle any messages from Remote if necessary
+    }
+
+    override fun onMessage(bytes: ByteBuffer) {
+        Log.d("OriginApp", "Received bytes from Remote: ${bytes.remaining()} bytes")
+        // Handle any binary data from Remote if necessary
+    }
+
+    override fun onFailure(t: Throwable, response: okhttp3.Response?) {
+        runOnUiThread {
+            textViewStatus.text = "Connection Failed: ${t.message}"
+            Log.e("OriginApp", "WebSocket connection failed", t)
+            buttonStream.isEnabled = true
+            buttonStopStream.isEnabled = false
+            mediaStreamer?.stopStreaming()
+            mediaStreamer = null
+        }
     }
 }
