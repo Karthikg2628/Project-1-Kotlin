@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
@@ -26,12 +27,14 @@
         android:layout_height="wrap_content"
         android:hint="Enter Remote IP Address (e.g., 192.168.1.100)"
         android:inputType="textUri"
-        android:text="192.168.1.100" /> <Button
-    android:id="@+id/buttonStream"
-    android:layout_width="wrap_content"
-    android:layout_height="wrap_content"
-    android:text="Start Stream"
-    android:layout_marginTop="16dp" />
+        android:text="192.168.1.100" />
+
+    <Button
+        android:id="@+id/buttonStream"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Start Stream"
+        android:layout_marginTop="16dp" />
 
     <Button
         android:id="@+id/buttonStopStream"

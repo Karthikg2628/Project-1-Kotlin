@@ -1,8 +1,9 @@
-// MainActivity.kt (Origin App)
-package com.example.originapp
+package com.example.origin
 
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
@@ -13,29 +14,46 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import com.example.origin.R
-import java.io.IOException
-import java.nio.ByteBuffer
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import android.graphics.Color
+import android.widget.EditText // Ensure this is imported for EditText type
 
-class MainActivity : AppCompatActivity(), WebSocketClientManager.WebSocketConnectionListener {
+// MainActivity now implements ServerStatusListener
+class MainActivity : AppCompatActivity(), ServerStatusListener {
 
     private lateinit var textViewFileName: TextView
     private lateinit var textViewStatus: TextView
     private lateinit var buttonSelectMp4: Button
     private lateinit var buttonStream: Button
     private lateinit var buttonStopStream: Button
-    private lateinit var editTextRemoteIp: TextView // Consider EditText for input
+    private lateinit var editTextRemoteIp: EditText // Confirmed as EditText in XML
 
     private var selectedMp4Uri: Uri? = null
-    private lateinit var wsClient: WebSocketClientManager
-    private var mediaStreamer: MediaStreamer? = null
 
-    // Activity Result API for file selection
+    private val statusUpdateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent?.let {
+                when (it.action) {
+                    StreamingForegroundService.ACTION_STATUS_UPDATE -> {
+                        val message = it.getStringExtra(StreamingForegroundService.EXTRA_MESSAGE) ?: "Unknown Status"
+                        val color = it.getIntExtra(StreamingForegroundService.EXTRA_COLOR, Color.BLACK)
+                        val isRunning = it.getBooleanExtra(StreamingForegroundService.EXTRA_IS_RUNNING, false)
+                        sendStatusUpdate(message, color, isRunning)
+                    }
+                    StreamingForegroundService.ACTION_DEBUG_INFO -> {
+                        val message = it.getStringExtra(StreamingForegroundService.EXTRA_MESSAGE) ?: "No debug info"
+                        sendDebugInfo(message)
+                    }
+                }
+            }
+        }
+    }
+
     private val pickMp4File = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
             selectedMp4Uri = uri
             textViewFileName.text = "Selected: ${getFileName(uri)}"
-            buttonStream.isEnabled = true // Enable stream button once file is selected
+            buttonStream.isEnabled = true
         } else {
             textViewFileName.text = "No file selected"
             buttonStream.isEnabled = false
@@ -44,16 +62,16 @@ class MainActivity : AppCompatActivity(), WebSocketClientManager.WebSocketConnec
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main) // You'll create this layout
+        setContentView(R.layout.activity_main)
 
         textViewFileName = findViewById(R.id.textViewFileName)
         textViewStatus = findViewById(R.id.textViewStatus)
         buttonSelectMp4 = findViewById(R.id.buttonSelectMp4)
         buttonStream = findViewById(R.id.buttonStream)
         buttonStopStream = findViewById(R.id.buttonStopStream)
-        editTextRemoteIp = findViewById(R.id.editTextRemoteIp) // Assuming ID
+        editTextRemoteIp = findViewById(R.id.editTextRemoteIp) // Now casted as EditText
 
-        buttonStream.isEnabled = false // Disable initially
+        buttonStream.isEnabled = false
         buttonStopStream.isEnabled = false
 
         buttonSelectMp4.setOnClickListener {
@@ -77,35 +95,39 @@ class MainActivity : AppCompatActivity(), WebSocketClientManager.WebSocketConnec
             stopStreaming()
         }
 
-        // Initialize WebSocket client (can be done earlier, but connect on stream start)
-        // For demonstration, let's assume a default IP for testing or get it from EditText
-        // wsClient = WebSocketClientManager("192.168.1.100", 8080, this)
+        val filter = IntentFilter().apply {
+            addAction(StreamingForegroundService.ACTION_STATUS_UPDATE)
+            addAction(StreamingForegroundService.ACTION_DEBUG_INFO)
+        }
+        LocalBroadcastManager.getInstance(this).registerReceiver(statusUpdateReceiver, filter)
+
+        textViewStatus.text = "Status: Ready to select MP4"
+        textViewStatus.setTextColor(Color.BLACK)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(statusUpdateReceiver)
     }
 
     private fun startStreaming(mp4Uri: Uri, remoteIp: String) {
-        if (mediaStreamer != null && mediaStreamer?.isStreaming?.get() == true) {
-            Toast.makeText(this, "Already streaming!", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        wsClient = WebSocketClientManager(remoteIp, 8080, this) // Port 8080 assumed for Remote
-        wsClient.connect()
-        textViewStatus.text = "Connecting to Remote..."
+        StreamingForegroundService.start(this, mp4Uri, remoteIp) // <-- Direct call to service helper
+        textViewStatus.text = "Starting Streaming Service..."
+        textViewStatus.setTextColor(Color.GRAY)
         buttonStream.isEnabled = false
         buttonStopStream.isEnabled = true
-
-        // MediaStreamer will be started on WebSocket connection `onConnected`
+        Toast.makeText(this, "Attempting to start streaming service", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopStreaming() {
-        mediaStreamer?.stopStreaming()
-        wsClient.disconnect()
+        StreamingForegroundService.stop(this) // <-- Direct call to service helper
         textViewStatus.text = "Stream Stopped."
+        textViewStatus.setTextColor(Color.BLACK)
         buttonStream.isEnabled = true
         buttonStopStream.isEnabled = false
+        Toast.makeText(this, "Streaming service stopped", Toast.LENGTH_SHORT).show()
     }
 
-    // Helper to get file name from Uri
     private fun getFileName(uri: Uri): String {
         var result: String? = null
         if (uri.scheme == "content") {
@@ -128,47 +150,18 @@ class MainActivity : AppCompatActivity(), WebSocketClientManager.WebSocketConnec
         return result ?: "Unknown File"
     }
 
-    // --- WebSocketConnectionListener implementation ---
-    override fun onConnected() {
+    override fun sendStatusUpdate(message: String, color: Int, isRunning: Boolean) {
         runOnUiThread {
-            textViewStatus.text = "Connected to Remote."
-            // Start streaming only after WebSocket is connected
-            selectedMp4Uri?.let { uri ->
-                mediaStreamer = MediaStreamer(applicationContext, uri, wsClient)
-                mediaStreamer?.startStreaming()
-                Toast.makeText(this, "Streaming started!", Toast.LENGTH_SHORT).show()
-            }
+            textViewStatus.text = "Status: $message"
+            textViewStatus.setTextColor(color)
+            buttonStream.isEnabled = !isRunning
+            buttonStopStream.isEnabled = isRunning
         }
     }
 
-    override fun onDisconnected(code: Int, reason: String) {
+    override fun sendDebugInfo(message: String) {
         runOnUiThread {
-            textViewStatus.text = "Disconnected: $reason (Code: $code)"
-            buttonStream.isEnabled = true
-            buttonStopStream.isEnabled = false
-            mediaStreamer?.stopStreaming() // Ensure streamer also stops
-            mediaStreamer = null
-        }
-    }
-
-    override fun onMessage(text: String) {
-        Log.d("OriginApp", "Received text from Remote: $text")
-        // Handle any messages from Remote if necessary
-    }
-
-    override fun onMessage(bytes: ByteBuffer) {
-        Log.d("OriginApp", "Received bytes from Remote: ${bytes.remaining()} bytes")
-        // Handle any binary data from Remote if necessary
-    }
-
-    override fun onFailure(t: Throwable, response: okhttp3.Response?) {
-        runOnUiThread {
-            textViewStatus.text = "Connection Failed: ${t.message}"
-            Log.e("OriginApp", "WebSocket connection failed", t)
-            buttonStream.isEnabled = true
-            buttonStopStream.isEnabled = false
-            mediaStreamer?.stopStreaming()
-            mediaStreamer = null
+            Log.d("MainActivityDebug", message)
         }
     }
 }

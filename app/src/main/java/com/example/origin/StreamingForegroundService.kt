@@ -1,5 +1,4 @@
-// StreamingForegroundService.kt (Origin App)
-package com.example.origin // Ensure this matches your manifest package
+package com.example.origin
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,18 +10,21 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager // Import for LocalBroadcastManager
-import com.example.originapp.MediaStreamer
-import com.example.originapp.WebSocketClientManager
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import java.nio.ByteBuffer
+import okio.ByteString
+import java.util.concurrent.atomic.AtomicBoolean
 
 // This service will run in the foreground to handle video/audio streaming
-class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketConnectionListener {
+class StreamingForegroundService : Service(), WSClient.WSClientListener {
 
-    private var wsClient: WebSocketClientManager? = null
+    private var wsClient: WSClient? = null
     private var mediaStreamer: MediaStreamer? = null
     private var streamingUri: Uri? = null
     private var remoteIpAddress: String? = null
+
+    // New: Track connection state locally
+    private val _isConnected = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
@@ -37,7 +39,7 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Streaming in Progress")
             .setContentText("Connecting to remote...")
-            .setSmallIcon(androidx.appcompat.R.drawable.notification_icon_background) // IMPORTANT: Change this icon to your app's icon, e.g., R.mipmap.ic_launcher
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
@@ -61,9 +63,11 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
         }
 
         // Initialize and connect WebSocket client
-        // Only connect if not already connected or if the client needs re-initialization
-        if (wsClient == null || wsClient?.isConnected() == false) {
-            wsClient = WebSocketClientManager(remoteIpAddress!!, 8080, this)
+        // Only connect if not already connected
+        if (wsClient == null || !_isConnected.get()) {
+            // FIX: Pass only the IP address to WSClient, not the full URI.
+            // WSClient expects just the IP to construct "ws://IP:PORT".
+            wsClient = WSClient(remoteIpAddress!!, this)
             wsClient?.connect()
             updateNotification("Connecting to Remote: $remoteIpAddress")
             sendStatusBroadcast("Connecting to Remote: $remoteIpAddress", android.graphics.Color.GRAY, true)
@@ -106,7 +110,7 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Streaming in Progress")
             .setContentText(content)
-            .setSmallIcon(androidx.appcompat.R.drawable.notification_icon_background) // IMPORTANT: Change this icon!
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -115,14 +119,14 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
 
     private fun startMediaStreamerIfReady() {
         // Only start MediaStreamer if WebSocket is connected, URI and IP are present, and streamer is not already running
-        if (wsClient?.isConnected() == true && streamingUri != null && mediaStreamer == null) {
+        if (_isConnected.get() && streamingUri != null && mediaStreamer == null) {
             mediaStreamer = MediaStreamer(applicationContext, streamingUri!!, wsClient!!)
             mediaStreamer?.startStreaming()
             updateNotification("Streaming to: ${remoteIpAddress}")
             sendStatusBroadcast("Streaming to: ${remoteIpAddress}", android.graphics.Color.GREEN, true)
             Log.d(TAG, "MediaStreamer started.")
         } else {
-            Log.w(TAG, "Cannot start MediaStreamer. WS connected: ${wsClient?.isConnected()}, URI present: ${streamingUri != null}, Streamer null: ${mediaStreamer == null}")
+            Log.w(TAG, "Cannot start MediaStreamer. WS connected: ${_isConnected.get()}, URI present: ${streamingUri != null}, Streamer null: ${mediaStreamer == null}")
         }
     }
 
@@ -144,13 +148,15 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
-    // --- WebSocketConnectionListener implementation (from WebSocketClientManager) ---
+    // --- WSClient.WSClientListener implementation ---
     override fun onConnected() {
+        _isConnected.set(true) // Update local connection state
         Log.d(TAG, "WebSocket Connected within service.")
         startMediaStreamerIfReady() // Attempt to start streaming once connected
     }
 
     override fun onDisconnected(code: Int, reason: String) {
+        _isConnected.set(false) // Update local connection state
         Log.d(TAG, "WebSocket Disconnected within service: $reason (Code: $code)")
         updateNotification("Disconnected: $reason")
         sendStatusBroadcast("Disconnected: $reason (Code: $code)", android.graphics.Color.RED, false)
@@ -165,13 +171,14 @@ class StreamingForegroundService : Service(), WebSocketClientManager.WebSocketCo
         sendDebugBroadcast("Remote: $text") // Forward to UI as debug info
     }
 
-    override fun onMessage(bytes: ByteBuffer) {
-        Log.d(TAG, "Received bytes from Remote: ${bytes.remaining()} bytes")
+    override fun onMessage(bytes: ByteString) {
+        Log.d(TAG, "Received bytes from Remote: ${bytes.size} bytes")
         // Handle any binary data from Remote if necessary
-        sendDebugBroadcast("Remote: Received ${bytes.remaining()} bytes") // Forward to UI as debug info
+        sendDebugBroadcast("Remote: Received ${bytes.size} bytes") // Forward to UI as debug info
     }
 
     override fun onFailure(t: Throwable, response: okhttp3.Response?) {
+        _isConnected.set(false) // Update local connection state
         Log.e(TAG, "WebSocket connection failed within service", t)
         updateNotification("Connection Failed: ${t.message}")
         sendStatusBroadcast("Connection Failed: ${t.message}", android.graphics.Color.RED, false)

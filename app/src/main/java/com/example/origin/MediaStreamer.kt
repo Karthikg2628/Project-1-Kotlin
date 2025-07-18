@@ -1,168 +1,217 @@
-// MediaStreamer.kt (Origin App)
-package com.example.originapp
+package com.example.origin
 
 import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
+import java.io.IOException
 import java.nio.ByteBuffer
-import java.util.concurrent.atomic.AtomicBoolean
 
 class MediaStreamer(
     private val context: Context,
-    private val mp4Uri: Uri,
-    private val wsClient: WebSocketClientManager
-) : Runnable {
-
-    val isStreaming = AtomicBoolean(false)
-    private val isStopped = AtomicBoolean(false)
+    private val videoUri: Uri,
+    private val wsClient: WSClient
+) {
 
     private var extractor: MediaExtractor? = null
-    private var videoTrackIndex = -1
-    private var audioTrackIndex = -1
-    private var videoFormat: MediaFormat? = null
-    private var audioFormat: MediaFormat? = null
+    private var videoTrackIndex: Int = -1
+    private var audioTrackIndex: Int = -1
+    private var videoTrackFormat: MediaFormat? = null
+    private var audioTrackFormat: MediaFormat? = null
+
+    @Volatile
+    private var isStreaming = false
+    private var streamingThread: Thread? = null
 
     fun startStreaming() {
-        isStreaming.set(true)
-        isStopped.set(false)
-        Thread(this).start()
+        if (isStreaming) {
+            Log.w(TAG, "Already streaming.")
+            return
+        }
+
+        isStreaming = true
+        streamingThread = Thread {
+            try {
+                initializeExtractor()
+                sendCodecInfo() // This sends formats and CSD
+                // After sending codec info, seek the extractor back to the beginning.
+                // This ensures the streaming loop starts from the beginning of the actual media data.
+                if (videoTrackIndex != -1) {
+                    extractor?.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    Log.d(TAG, "Extractor seeked to start for video track.")
+                } else if (audioTrackIndex != -1) {
+                    // Only seek if video track wasn't found and audio track exists
+                    extractor?.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    Log.d(TAG, "Extractor seeked to start for audio track.")
+                }
+
+
+                streamMediaData()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during streaming: ${e.message}", e)
+                wsClient.sendMessage(Constants.COMMAND_STOP_STREAMING) // Notify remote of error
+            } finally {
+                releaseResources()
+            }
+        }
+        streamingThread?.name = "MediaStreamingThread"
+        streamingThread?.start()
+        Log.d(TAG, "MediaStreamer started.")
     }
 
     fun stopStreaming() {
-        isStreaming.set(false)
-        isStopped.set(true) // Signal the thread to stop gracefully
+        if (!isStreaming) {
+            Log.w(TAG, "Not streaming, nothing to stop.")
+            return
+        }
+        isStreaming = false
+        streamingThread?.join(1000) // Wait for the thread to finish
+        streamingThread = null
+        releaseResources()
+        wsClient.sendMessage(Constants.COMMAND_STOP_STREAMING) // Notify remote to stop
+        Log.d(TAG, "MediaStreamer stopped.")
     }
 
-    override fun run() {
-        runCatching {
-            setupExtractor()
-            if (videoTrackIndex == -1 && audioTrackIndex == -1) {
-                Log.e(TAG, "No video or audio track found in MP4.")
-                return
+    private fun initializeExtractor() {
+        extractor = MediaExtractor()
+        try {
+            extractor?.setDataSource(context, videoUri, null)
+        } catch (e: Exception) {
+            throw IOException("Failed to instantiate extractor. ${e.message}", e)
+        }
+
+        for (i in 0 until (extractor?.trackCount ?: 0)) {
+            val format = extractor?.getTrackFormat(i)
+            val mime = format?.getString(MediaFormat.KEY_MIME)
+            if (mime?.startsWith("video/") == true) {
+                videoTrackIndex = i
+                videoTrackFormat = format
+                Log.d(TAG, "Video track found: $mime")
+            } else if (mime?.startsWith("audio/") == true) {
+                audioTrackIndex = i
+                audioTrackFormat = format
+                Log.d(TAG, "Audio track found: $mime")
             }
+        }
 
-            // Send Codec Specific Data (CSD) first
-            sendCodecSpecificData()
+        if (videoTrackIndex == -1 && audioTrackIndex == -1) {
+            throw IOException("No video or audio track found in the media.")
+        }
 
-            // Send START command
-            wsClient.sendMessage(WebSocketClientManager.COMMAND_START_STREAMING)
-
-            // Start streaming loop
-            streamMediaData()
-        }.onFailure { e ->
-            Log.e(TAG, "Error during media streaming setup or execution", e)
-        }.also {
-            releaseResources()
-            wsClient.sendMessage(WebSocketClientManager.COMMAND_STOP_STREAMING) // Send STOP command
-            Log.d(TAG, "MediaStreamer finished.")
+        // IMPORTANT: Select the tracks after finding them
+        if (videoTrackIndex != -1) {
+            extractor?.selectTrack(videoTrackIndex)
+            Log.d(TAG, "Selected video track: $videoTrackIndex")
+        }
+        if (audioTrackIndex != -1) {
+            extractor?.selectTrack(audioTrackIndex)
+            Log.d(TAG, "Selected audio track: $audioTrackIndex")
         }
     }
 
-    private fun setupExtractor() {
-        extractor = MediaExtractor().apply {
-            setDataSource(context, mp4Uri, null)
+    private fun sendCodecInfo() {
+        Log.d(TAG, "Sending Codec Information (Formats and CSD)...")
 
-            for (i in 0 until trackCount) {
-                val format = getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME)
-                if (mime?.startsWith("video/") == true && videoTrackIndex == -1) {
-                    videoTrackIndex = i
-                    videoFormat = format
-                    Log.d(TAG, "Video track found: $mime")
-                } else if (mime?.startsWith("audio/") == true && audioTrackIndex == -1) {
-                    audioTrackIndex = i
-                    audioFormat = format
-                    Log.d(TAG, "Audio track found: $mime")
-                }
-            }
-        }
-    }
+        // 1. Send Video MediaFormat Data
+        videoTrackFormat?.let { format ->
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC
+            val width = format.getInteger(MediaFormat.KEY_WIDTH)
+            val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+            val frameRate = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) format.getInteger(MediaFormat.KEY_FRAME_RATE) else 30
 
-    private fun sendCodecSpecificData() {
-        // Send video CSD (SPS and PPS for H.264)
-        videoFormat?.let { format ->
-            format.getByteBuffer("csd-0")?.let { csd ->
-                sendPacket(PACKET_TYPE_VIDEO_CSD, 0, csd) // PTS 0 for SPS
-            }
-            format.getByteBuffer("csd-1")?.let { csd ->
-                sendPacket(PACKET_TYPE_VIDEO_CSD, 1, csd) // PTS 1 for PPS
-            }
+            wsClient.sendVideoFormat(mime, width, height, frameRate)
+            Log.d(TAG, "Sent Video Format Data: $mime, ${width}x${height}, $frameRate fps")
         }
 
-        // Send audio CSD (AudioSpecificConfig for AAC)
-        audioFormat?.let { format ->
-            format.getByteBuffer("csd-0")?.let { csd ->
-                sendPacket(PACKET_TYPE_AUDIO_CSD, 0, csd) // PTS 0 for AAC CSD
-            }
+        // 2. Send Audio MediaFormat Data (Consider removing if video-only)
+        audioTrackFormat?.let { format ->
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_AUDIO_AAC
+            val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+            wsClient.sendAudioFormat(mime, sampleRate, channelCount)
+            Log.d(TAG, "Sent Audio Format Data: $mime, $sampleRate Hz, $channelCount channels")
         }
+
+        // 3. Send CSD Data (Codec Specific Data)
+        // Note: For H.264, csd-0 is SPS, csd-1 is PPS. Both are often needed.
+        videoTrackFormat?.getByteBuffer("csd-0")?.let { csd0 ->
+            csd0.rewind() // Ensure buffer is ready for reading from start
+            wsClient.sendVideoCSD(csd0)
+            Log.d(TAG, "Sent Video CSD (csd-0), size: ${csd0.limit()}")
+        }
+        videoTrackFormat?.getByteBuffer("csd-1")?.let { csd1 ->
+            csd1.rewind() // Ensure buffer is ready for reading from start
+            wsClient.sendVideoCSD(csd1)
+            Log.d(TAG, "Sent Video CSD (csd-1), size: ${csd1.limit()}")
+        }
+        audioTrackFormat?.getByteBuffer("csd-0")?.let { csd0 ->
+            csd0.rewind() // Ensure buffer is ready for reading from start
+            wsClient.sendAudioCSD(csd0)
+            Log.d(TAG, "Sent Audio CSD (csd-0), size: ${csd0.limit()}")
+        }
+
+        // 4. Send START_STREAM Command
+        wsClient.sendMessage(Constants.COMMAND_START_STREAMING)
+        Log.d(TAG, "Sent START_STREAM command.")
     }
 
     private fun streamMediaData() {
-        val buffer = ByteBuffer.allocate(512 * 1024) // 512KB buffer
+        val buffer = ByteBuffer.allocate(1024 * 1024) // 1MB buffer, adjust as needed for large frames
 
-        extractor?.run {
-            if (videoTrackIndex != -1) selectTrack(videoTrackIndex)
-            if (audioTrackIndex != -1) selectTrack(audioTrackIndex)
+        while (isStreaming) {
+            // Read next sample
+            val sampleSize = extractor?.readSampleData(buffer, 0) ?: -1
 
-            // Optional: seek to start to ensure correct initial sample times
-            seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-
-            while (isStreaming.get() && !isStopped.get()) {
-                val trackIndex = sampleTrackIndex
-                if (trackIndex == -1) {
-                    Log.d(TAG, "End of MP4 stream.")
-                    break // All tracks exhausted
-                }
-
-                val presentationTimeUs = sampleTime
-                val sampleSize = readSampleData(buffer, 0)
-                val flags = sampleFlags
-
-                if (sampleSize > 0) {
-                    buffer.limit(sampleSize)
-                    buffer.rewind() // Rewind buffer before sending
-
-                    when (trackIndex) {
-                        videoTrackIndex -> sendPacket(PACKET_TYPE_VIDEO, presentationTimeUs, buffer)
-                        audioTrackIndex -> sendPacket(PACKET_TYPE_AUDIO, presentationTimeUs, buffer)
-                    }
-                } else if (sampleSize == -1) {
-                    // Reached end of current track, but other tracks might still have data.
-                    // The main loop condition `sampleTrackIndex == -1` will handle global end.
-                    Log.d(TAG, "Reached end of current track.")
-                }
-
-                advance() // Advance to the next sample
+            if (sampleSize < 0) {
+                Log.d(TAG, "End of stream reached. Signalling stop.")
+                isStreaming = false // Indicate streaming finished naturally
+                wsClient.sendMessage(Constants.COMMAND_STOP_STREAMING) // Notify remote of end of stream
+                break // Exit the loop
             }
+
+            val currentTrackIndex = extractor?.sampleTrackIndex ?: -1
+            val presentationTimeUs = extractor?.sampleTime ?: 0L
+            val sampleFlags = extractor?.sampleFlags ?: 0
+
+            buffer.limit(sampleSize) // Set the buffer's limit to the actual data size
+            buffer.rewind() // Reset position to 0 for reading
+
+            // Log.v(TAG, "Read sample from track $currentTrackIndex, size $sampleSize, pts $presentationTimeUs, flags $sampleFlags")
+
+            if (currentTrackIndex == videoTrackIndex) {
+                // Ensure IDR (key frame) is handled correctly if any special flag needed
+                // For H.264, MediaCodec.BUFFER_FLAG_KEY_FRAME is important.
+                // MediaExtractor provides this as MediaExtractor.SAMPLE_FLAG_SYNC.
+                // You might want to include this flag in your protocol for advanced receivers.
+                // For now, it's just raw frame data + PTS.
+                wsClient.sendVideoFrame(buffer, presentationTimeUs)
+            } else if (currentTrackIndex == audioTrackIndex) {
+                wsClient.sendAudioFrame(buffer, presentationTimeUs)
+            } else {
+                Log.w(TAG, "Skipping sample from unselected track: $currentTrackIndex")
+            }
+
+            // Advance to the next sample in the extractor
+            extractor?.advance()
+            buffer.clear() // Clear the buffer for the next read operation (resets position to 0, limit to capacity)
         }
+        Log.d(TAG, "Media data streaming loop finished.")
     }
 
-    private fun sendPacket(type: Byte, ptsUs: Long, data: ByteBuffer) {
-        // Packet format: [1-byte type] | [8-byte PTS (long)] | [Encoded Data]
-        val packet = ByteBuffer.allocate(1 + 8 + data.remaining()).apply {
-            put(type)
-            putLong(ptsUs)
-            put(data)
-            flip() // Prepare for reading
-        }
-        wsClient.sendBytes(packet)
-    }
 
     private fun releaseResources() {
         extractor?.release()
         extractor = null
-        // If you were re-encoding using MediaCodec, release encoder here too.
+        videoTrackFormat = null
+        audioTrackFormat = null
+        videoTrackIndex = -1
+        audioTrackIndex = -1
+        Log.d(TAG, "MediaStreamer resources released.")
     }
 
     companion object {
         private const val TAG = "MediaStreamer"
-
-        // Packet types for network transmission
-        const val PACKET_TYPE_VIDEO: Byte = 0
-        const val PACKET_TYPE_AUDIO: Byte = 1
-        const val PACKET_TYPE_VIDEO_CSD: Byte = 2 // Codec Specific Data
-        const val PACKET_TYPE_AUDIO_CSD: Byte = 3
     }
 }
